@@ -71,3 +71,12 @@ async fn aborted_send() {
     let received = rx.try_recv();
     assert_eq!(received, Err(error::TryRecvError::Empty));
 }
+
+#[tokio::test]
+async fn send_non_sync() {
+    let (mut tx, mut rx) = channel();
+    let sent = tokio::spawn(async move { tx.send(std::cell::Cell::new(42)).await });
+    let received = rx.recv().await;
+    assert_eq!(sent.await.unwrap(), Ok(()));
+    assert_eq!(received.unwrap().get(), 42);
+}

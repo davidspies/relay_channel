@@ -1,6 +1,6 @@
 [package]
 name = "relay_channel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A single-producer, single-consumer channel where the sender waits for the receiver to receive the message before returning."
 license = "MIT"

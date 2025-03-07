@@ -41,6 +41,8 @@
 //! }
 //! ```
 
+use std::sync::Mutex;
+
 use consume_on_drop::ConsumeOnDrop;
 use tokio::{select, sync::watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -48,7 +50,10 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 pub use tokio::sync::mpsc::error;
 
 struct Inner<T> {
-    tx: watch::Sender<Option<T>>,
+    // We wrap the value in a Mutex so that it is not required to be `Sync` in
+    // order to be sent between threads (the value is only ever accessed with
+    // Mutex::into_inner).
+    tx: watch::Sender<Option<Mutex<T>>>,
     dropped: CancellationToken,
     _drop_guard: DropGuard,
 }
@@ -96,10 +101,10 @@ impl<T> Inner<T> {
 
     async fn send(&mut self, value: T) -> Result<(), error::SendError<T>> {
         let mut rx = self.tx.subscribe();
-        let old_value = self.tx.send_replace(Some(value));
+        let old_value = self.tx.send_replace(Some(Mutex::new(value)));
         assert!(old_value.is_none());
         let on_drop = ConsumeOnDrop::new(|| {
-            let _: Option<T> = self.tx.send_replace(None);
+            let _: Option<Mutex<T>> = self.tx.send_replace(None);
         });
         select! {
             result = rx.wait_for(|value| value.is_none()) => {
@@ -110,7 +115,7 @@ impl<T> Inner<T> {
         }
         let _disarmed = ConsumeOnDrop::into_inner(on_drop);
         match self.tx.send_replace(None) {
-            Some(value) => Err(error::SendError(value)),
+            Some(value) => Err(error::SendError(value.into_inner().unwrap())),
             None => Ok(()),
         }
     }
@@ -129,7 +134,7 @@ impl<T> Inner<T> {
             // returned by `wait_for` and this `send_replace` call so we need to
             // double-check that the value is still there.
             match self.tx.send_replace(None) {
-                Some(value) => return Some(value),
+                Some(value) => return Some(value.into_inner().unwrap()),
                 None => {
                     if self.dropped.is_cancelled() {
                         return None;
@@ -141,7 +146,7 @@ impl<T> Inner<T> {
 
     fn try_recv(&mut self) -> Result<T, error::TryRecvError> {
         match self.tx.send_replace(None) {
-            Some(value) => Ok(value),
+            Some(value) => Ok(value.into_inner().unwrap()),
             None => {
                 if self.dropped.is_cancelled() {
                     Err(error::TryRecvError::Disconnected)
