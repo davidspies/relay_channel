@@ -41,25 +41,23 @@
 //! }
 //! ```
 
-use std::{mem, sync::Arc};
+use std::mem;
 
-use awaitable_bool::AwaitableBool;
 use consume_on_drop::ConsumeOnDrop;
 use derive_where::derive_where;
 use sync_wrapper::SyncWrapper;
-use tokio::{select, sync::watch};
+use tokio::sync::watch;
 
 pub mod error;
 
 #[derive_where(Clone)]
 struct Inner<T> {
     tx: watch::Sender<ValueHolder<T>>,
-    dropped: Arc<AwaitableBool>,
 }
 
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
-        self.dropped.set_true();
+        self.tx.send_modify(|holder| holder.dropped = true);
     }
 }
 
@@ -67,6 +65,7 @@ impl<T> Drop for Inner<T> {
 struct ValueHolder<T> {
     sender_slot: Option<SyncWrapper<T>>,
     receiver_slot: ReceiverSlot<T>,
+    dropped: bool,
 }
 
 #[derive_where(Default)]
@@ -113,8 +112,7 @@ impl<T> Receiver<T> {
 impl<T> Inner<T> {
     fn new() -> Self {
         let tx = watch::Sender::new(ValueHolder::default());
-        let dropped = Arc::new(AwaitableBool::new(false));
-        Self { tx, dropped }
+        Self { tx }
     }
 
     async fn send(&mut self, value: T) -> Result<(), self::error::SendError<T>> {
@@ -136,26 +134,28 @@ impl<T> Inner<T> {
         let mut rejected = None;
         let on_drop =
             ConsumeOnDrop::new(|| self.tx.send_modify(|holder| holder.sender_slot = None));
-        select! {
-            result = rx.wait_for(|holder| holder.sender_slot.is_none()) => {
-                let holder = result.unwrap();
-                assert!(holder.sender_slot.is_none());
-            },
-            () = self.dropped.wait_true() => {
-                self.tx.send_modify(|holder| rejected = holder.sender_slot.take())
-            },
-        }
+        let result = rx
+            .wait_for(|holder| holder.dropped || holder.sender_slot.is_none())
+            .await;
+        drop(result.unwrap());
         let _disarmed = ConsumeOnDrop::into_inner(on_drop);
+        self.tx.send_if_modified(|holder| {
+            rejected = holder.sender_slot.take().map(SyncWrapper::into_inner);
+            assert!(holder.dropped || rejected.is_none());
+            rejected.is_some()
+        });
         match rejected {
-            Some(value) => Err(self::error::SendError(value.into_inner())),
+            Some(value) => Err(self::error::SendError(value)),
             None => Ok(()),
         }
     }
 
     fn try_send(&mut self, value: T) -> Result<(), self::error::TrySendError<T>> {
         let mut rejected = None;
+        let mut dropped = false;
         self.tx.send_if_modified(|holder| {
             assert!(holder.sender_slot.is_none());
+            dropped = holder.dropped;
             let receiver_waiting = matches!(holder.receiver_slot, ReceiverSlot::ReceiverWaiting);
             if receiver_waiting {
                 holder.receiver_slot = ReceiverSlot::Received(SyncWrapper::new(value));
@@ -166,7 +166,7 @@ impl<T> Inner<T> {
         });
         match rejected {
             Some(value) => {
-                if self.dropped.is_true() {
+                if dropped {
                     Err(self::error::TrySendError::Closed(value))
                 } else {
                     Err(self::error::TrySendError::NotWaiting(value))
@@ -193,16 +193,14 @@ impl<T> Inner<T> {
             self.tx
                 .send_modify(|holder| holder.receiver_slot = ReceiverSlot::NoReceiver);
         });
-        select! {
-            result = rx.wait_for(|holder| {
+        let result = rx
+            .wait_for(|holder| {
                 let received = matches!(holder.receiver_slot, ReceiverSlot::Received(_));
                 assert!(received || holder.sender_slot.is_none());
-                received
-            }) => {
-                result.unwrap();
-            },
-            () = self.dropped.wait_true() => {},
-        }
+                holder.dropped || received
+            })
+            .await;
+        drop(result.unwrap());
         let _disarmed = ConsumeOnDrop::into_inner(on_drop);
         let mut value = ReceiverSlot::NoReceiver;
         self.tx
@@ -218,15 +216,17 @@ impl<T> Inner<T> {
 
     fn try_recv(&mut self) -> Result<T, self::error::TryRecvError> {
         let mut value = None;
+        let mut dropped = false;
         self.tx.send_if_modified(|holder| {
             assert!(matches!(holder.receiver_slot, ReceiverSlot::NoReceiver));
+            dropped = holder.dropped;
             value = holder.sender_slot.take();
             value.is_some()
         });
         match value {
             Some(value) => Ok(value.into_inner()),
             None => {
-                if self.dropped.is_true() {
+                if dropped {
                     Err(self::error::TryRecvError::Disconnected)
                 } else {
                     Err(self::error::TryRecvError::Empty)
