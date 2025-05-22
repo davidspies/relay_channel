@@ -232,5 +232,8 @@ impl<T> Inner<T> {
     }
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(all(test, not(loom)))]
+mod norm_tests;
+
+#[cfg(all(test, loom))]
+mod loom_tests;
