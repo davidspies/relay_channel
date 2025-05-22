@@ -15,7 +15,7 @@ derive-where = "1.4.0"
 sync_wrapper = "1.0.2"
 tokio = { version = "1.43.0", features = ["sync"] }
 # tokio = { git = "https://github.com/soooch/tokio.git", branch = "expose-loom", features = [
-# 	"sync",
+#     "sync",
 # ] }
 
 [target.'cfg(loom)'.dependencies]
@@ -25,7 +25,7 @@ loom = { version = "0.7.2", features = ["futures"] }
 futures = "0.3.31"
 tokio = { version = "1.43.0", features = ["macros", "rt", "time"] }
 # tokio = { git = "https://github.com/soooch/tokio.git", branch = "expose-loom", features = [
-# 	"macros",
-# 	"rt",
-# 	"time",
+#     "macros",
+#     "rt",
+#     "time",
 # ] }

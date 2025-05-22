@@ -1,3 +1,8 @@
+//! To run these tests, switch to the commented-out tokio dependency in Cargo.toml.
+//! Then run:
+//!
+//! `LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" cargo test --tests --release -- --nocapture`
+
 #[test]
 fn parallel_send_recv() {
     loom::model(|| {
