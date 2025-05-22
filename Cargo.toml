@@ -6,11 +6,26 @@ description = "A single-producer, single-consumer channel where the sender waits
 license = "MIT"
 repository = "https://github.com/davidspies/relay_channel"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 consume_on_drop = "0.1.1"
-tokio = { version = "1.43.0", features = ["macros", "sync"] }
-tokio-util = "0.7.13"
+derive-where = "1.4.0"
+sync_wrapper = "1.0.2"
+tokio = { version = "1.43.0", features = ["sync"] }
+# tokio = { git = "https://github.com/soooch/tokio.git", branch = "expose-loom", features = [
+# 	"sync",
+# ] }
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7.2", features = ["futures"] }
 
 [dev-dependencies]
 futures = "0.3.31"
-tokio = { version = "1.43.0", features = ["rt", "time"] }
+tokio = { version = "1.43.0", features = ["macros", "rt", "time"] }
+# tokio = { git = "https://github.com/soooch/tokio.git", branch = "expose-loom", features = [
+# 	"macros",
+# 	"rt",
+# 	"time",
+# ] }

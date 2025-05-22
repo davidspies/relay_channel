@@ -41,21 +41,37 @@
 //! }
 //! ```
 
-use std::sync::Mutex;
+use std::mem;
 
 use consume_on_drop::ConsumeOnDrop;
-use tokio::{select, sync::watch};
-use tokio_util::sync::{CancellationToken, DropGuard};
+use derive_where::derive_where;
+use sync_wrapper::SyncWrapper;
+use tokio::sync::watch;
 
-pub use tokio::sync::mpsc::error;
+pub mod error;
 
-struct Inner<T> {
-    // We wrap the value in a Mutex so that it is not required to be `Sync` in
-    // order to be sent between threads (the value is only ever accessed with
-    // Mutex::into_inner).
-    tx: watch::Sender<Option<Mutex<T>>>,
-    dropped: CancellationToken,
-    _drop_guard: DropGuard,
+#[derive_where(Clone)]
+struct Inner<T>(watch::Sender<ValueHolder<T>>);
+
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        self.0.send_modify(|holder| holder.dropped = true);
+    }
+}
+
+#[derive_where(Default)]
+struct ValueHolder<T> {
+    sender_slot: Option<SyncWrapper<T>>,
+    receiver_slot: ReceiverSlot<T>,
+    dropped: bool,
+}
+
+#[derive_where(Default)]
+enum ReceiverSlot<T> {
+    #[derive_where(default)]
+    NoReceiver,
+    ReceiverWaiting,
+    Received(SyncWrapper<T>),
 }
 
 pub struct Sender<T>(Inner<T>);
@@ -70,9 +86,13 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 impl<T> Sender<T> {
     /// Only one thread can send a value at a time on a [relay_channel](crate).
     /// This is enforced by making [Sender] not implement [Clone] and the
-    /// [send](Self::send) method require an unshared reference.
+    /// [send](Self::send) method require an unshared (`&mut self`) reference.
     pub async fn send(&mut self, value: T) -> Result<(), error::SendError<T>> {
         self.0.send(value).await
+    }
+
+    pub fn try_send(&mut self, value: T) -> Result<(), error::TrySendError<T>> {
+        self.0.try_send(value)
     }
 }
 
@@ -89,84 +109,131 @@ impl<T> Receiver<T> {
 
 impl<T> Inner<T> {
     fn new() -> Self {
-        let tx = watch::Sender::new(None);
-        let dropped = CancellationToken::new();
-        let _drop_guard = dropped.clone().drop_guard();
-        Self {
-            tx,
-            dropped,
-            _drop_guard,
+        Self(watch::Sender::new(ValueHolder::default()))
+    }
+
+    async fn send(&mut self, value: T) -> Result<(), self::error::SendError<T>> {
+        let mut received = false;
+        self.0.send_modify(|holder| match holder.receiver_slot {
+            ReceiverSlot::ReceiverWaiting => {
+                holder.receiver_slot = ReceiverSlot::Received(SyncWrapper::new(value));
+                received = true;
+            }
+            _ => {
+                let old_value = holder.sender_slot.replace(SyncWrapper::new(value));
+                assert!(old_value.is_none());
+            }
+        });
+        if received {
+            return Ok(());
+        }
+        let mut rx = self.0.subscribe();
+        let mut rejected = None;
+        let on_drop = ConsumeOnDrop::new(|| self.0.send_modify(|holder| holder.sender_slot = None));
+        let result = rx
+            .wait_for(|holder| holder.dropped || holder.sender_slot.is_none())
+            .await;
+        drop(result.unwrap());
+        let _disarmed = ConsumeOnDrop::into_inner(on_drop);
+        self.0.send_if_modified(|holder| {
+            rejected = holder.sender_slot.take().map(SyncWrapper::into_inner);
+            assert!(holder.dropped || rejected.is_none());
+            rejected.is_some()
+        });
+        match rejected {
+            Some(value) => Err(self::error::SendError(value)),
+            None => Ok(()),
         }
     }
 
-    async fn send(&mut self, value: T) -> Result<(), error::SendError<T>> {
-        let mut rx = self.tx.subscribe();
-        let old_value = self.tx.send_replace(Some(Mutex::new(value)));
-        assert!(old_value.is_none());
-        let on_drop = ConsumeOnDrop::new(|| {
-            let _: Option<Mutex<T>> = self.tx.send_replace(None);
+    fn try_send(&mut self, value: T) -> Result<(), self::error::TrySendError<T>> {
+        let mut rejected = None;
+        let mut dropped = false;
+        self.0.send_if_modified(|holder| {
+            assert!(holder.sender_slot.is_none());
+            dropped = holder.dropped;
+            let receiver_waiting = matches!(holder.receiver_slot, ReceiverSlot::ReceiverWaiting);
+            if receiver_waiting {
+                holder.receiver_slot = ReceiverSlot::Received(SyncWrapper::new(value));
+            } else {
+                rejected = Some(value);
+            }
+            receiver_waiting
         });
-        select! {
-            result = rx.wait_for(|value| value.is_none()) => {
-                let none = result.unwrap();
-                assert!(none.is_none());
-            },
-            () = self.dropped.cancelled() => {}
-        }
-        let _disarmed = ConsumeOnDrop::into_inner(on_drop);
-        match self.tx.send_replace(None) {
-            Some(value) => Err(error::SendError(value.into_inner().unwrap())),
+        match rejected {
+            Some(value) => {
+                if dropped {
+                    Err(self::error::TrySendError::Closed(value))
+                } else {
+                    Err(self::error::TrySendError::NotWaiting(value))
+                }
+            }
             None => Ok(()),
         }
     }
 
     async fn recv(&mut self) -> Option<T> {
-        let mut rx = self.tx.subscribe();
-        loop {
-            select! {
-                result = rx.wait_for(|value| value.is_some()) => {
-                    let some = result.unwrap();
-                    assert!(some.is_some());
-                }
-                () = self.dropped.cancelled() => {},
+        let mut value = None;
+        self.0.send_modify(|holder| {
+            assert!(matches!(holder.receiver_slot, ReceiverSlot::NoReceiver));
+            value = holder.sender_slot.take();
+            if value.is_none() {
+                holder.receiver_slot = ReceiverSlot::ReceiverWaiting;
             }
-            // The sender could have been aborted between dropping the guard
-            // returned by `wait_for` and this `send_replace` call so we need to
-            // double-check that the value is still there.
-            match self.tx.send_replace(None) {
-                Some(value) => return Some(value.into_inner().unwrap()),
-                None => {
-                    if self.dropped.is_cancelled() {
-                        return None;
-                    }
-                }
+        });
+        if let Some(value) = value {
+            return Some(value.into_inner());
+        }
+        let mut rx = self.0.subscribe();
+        let on_drop = ConsumeOnDrop::new(|| {
+            self.0
+                .send_modify(|holder| holder.receiver_slot = ReceiverSlot::NoReceiver);
+        });
+        let result = rx
+            .wait_for(|holder| {
+                let received = matches!(holder.receiver_slot, ReceiverSlot::Received(_));
+                assert!(received || holder.sender_slot.is_none());
+                holder.dropped || received
+            })
+            .await;
+        drop(result.unwrap());
+        let _disarmed = ConsumeOnDrop::into_inner(on_drop);
+        let mut value = ReceiverSlot::NoReceiver;
+        self.0
+            .send_modify(|holder| mem::swap(&mut holder.receiver_slot, &mut value));
+        match value {
+            ReceiverSlot::Received(value) => Some(value.into_inner()),
+            ReceiverSlot::ReceiverWaiting => None,
+            ReceiverSlot::NoReceiver => {
+                unreachable!("Received variant cannot be changed by sender")
             }
         }
     }
 
-    fn try_recv(&mut self) -> Result<T, error::TryRecvError> {
-        match self.tx.send_replace(None) {
-            Some(value) => Ok(value.into_inner().unwrap()),
+    fn try_recv(&mut self) -> Result<T, self::error::TryRecvError> {
+        let mut value = None;
+        let mut dropped = false;
+        self.0.send_if_modified(|holder| {
+            assert!(matches!(holder.receiver_slot, ReceiverSlot::NoReceiver));
+            dropped = holder.dropped;
+            value = holder.sender_slot.take();
+            value.is_some()
+        });
+        match value {
+            Some(value) => Ok(value.into_inner()),
             None => {
-                if self.dropped.is_cancelled() {
-                    Err(error::TryRecvError::Disconnected)
+                if dropped {
+                    Err(self::error::TryRecvError::Disconnected)
                 } else {
-                    Err(error::TryRecvError::Empty)
+                    Err(self::error::TryRecvError::Empty)
                 }
             }
         }
     }
 }
 
-impl<T> Clone for Inner<T> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-            dropped: self.dropped.clone(),
-            _drop_guard: self.dropped.clone().drop_guard(),
-        }
-    }
-}
+#[cfg(all(test, not(loom)))]
+mod norm_tests;
 
-#[cfg(test)]
-mod tests;
+#[cfg(all(test, loom))]
+mod loom_tests;
